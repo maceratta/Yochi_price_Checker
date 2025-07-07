@@ -6,6 +6,7 @@ Run this to verify all components are working correctly.
 
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -64,33 +65,67 @@ def test_config_creation():
         return False
 
 def test_notifications():
-    """Test notification systems."""
-    print("Testing macOS notifications...")
+    """Test platform-appropriate notification systems."""
+    system = platform.system()
     
-    try:
-        # Test osascript availability
-        result = subprocess.run(
-            ["osascript", "-e", 'display notification "Test" with title "Test"'],
-            capture_output=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0:
-            print("✅ macOS notifications working")
-            return True
-        else:
-            print("❌ macOS notifications failed - check System Preferences")
-            return False
+    if system == "Darwin":
+        print("Testing macOS notifications...")
+        try:
+            # Test osascript availability
+            result = subprocess.run(
+                ["osascript", "-e", 'display notification "Test" with title "Test"'],
+                capture_output=True,
+                timeout=10
+            )
             
-    except subprocess.TimeoutExpired:
-        print("❌ Notification test timed out")
-        return False
-    except FileNotFoundError:
-        print("❌ osascript not found - not on macOS?")
-        return False
-    except Exception as e:
-        print(f"❌ Error testing notifications: {e}")
-        return False
+            if result.returncode == 0:
+                print("✅ macOS notifications working")
+                return True
+            else:
+                print("❌ macOS notifications failed - check System Preferences")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print("❌ Notification test timed out")
+            return False
+        except FileNotFoundError:
+            print("❌ osascript not found")
+            return False
+        except Exception as e:
+            print(f"❌ Error testing notifications: {e}")
+            return False
+    
+    elif system == "Linux":
+        print("Testing Linux notifications...")
+        try:
+            # Test notify-send availability
+            result = subprocess.run(
+                ["notify-send", "--app-name=Test", "Test", "Test notification"],
+                capture_output=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                print("✅ Linux notifications working")
+                return True
+            else:
+                print("⚠️  notify-send available but may not be configured")
+                print("   Desktop notifications will fallback to terminal output")
+                return True  # Still considered working due to fallback
+                
+        except FileNotFoundError:
+            print("⚠️  notify-send not found - using terminal fallback")
+            print("   This is normal for headless systems like Raspberry Pi")
+            return True  # Fallback is acceptable
+        except Exception as e:
+            print(f"⚠️  Error testing Linux notifications: {e}")
+            print("   Terminal fallback will be used")
+            return True
+    
+    else:
+        print(f"⚠️  Unknown platform: {system}")
+        print("   Desktop notifications may not work")
+        return True  # Don't fail for unknown platforms
 
 def test_email_setup():
     """Test email configuration."""

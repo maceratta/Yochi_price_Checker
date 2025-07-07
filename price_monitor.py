@@ -7,6 +7,7 @@ Monitors product prices and sends notifications when discounts are found.
 import json
 import logging
 import os
+import platform
 import re
 import smtplib
 import subprocess
@@ -29,6 +30,8 @@ class PriceMonitor:
         self.setup_logging()
         self.price_history = self.load_price_history()
         self.current_deal_info = None  # Store current deal information
+        self.is_macos = self.detect_platform_macos()
+        self.is_raspberry_pi = self.detect_platform_raspberry_pi()
 
     def load_config(self) -> Dict:
         """Load configuration from JSON file."""
@@ -48,8 +51,10 @@ class PriceMonitor:
             "regular_price": None,
             "check_interval_minutes": 60,
             "price_history_file": "price_history.json",
+            "notification_frequency": "weekly",
             "notifications": {
                 "macos_enabled": True,
+                "linux_enabled": True,
                 "email_enabled": False,
                 "telegram_enabled": False
             },
@@ -89,6 +94,49 @@ class PriceMonitor:
             ]
         )
         self.logger = logging.getLogger(__name__)
+
+    def detect_platform_macos(self) -> bool:
+        """Detect if running on macOS."""
+        return platform.system() == "Darwin"
+
+    def detect_platform_raspberry_pi(self) -> bool:
+        """Detect if running on Raspberry Pi."""
+        try:
+            # Check for Raspberry Pi specific files
+            if os.path.exists("/proc/device-tree/model"):
+                with open("/proc/device-tree/model", "r") as f:
+                    model = f.read().strip()
+                    return "raspberry pi" in model.lower()
+            
+            # Fallback: check for ARM architecture on Linux
+            return platform.system() == "Linux" and "arm" in platform.machine().lower()
+        except Exception:
+            return False
+
+    def get_current_calendar_week(self) -> str:
+        """Get current calendar week in YYYY-WW format."""
+        today = datetime.now()
+        year, week_num, _ = today.isocalendar()
+        return f"{year}-W{week_num:02d}"
+
+    def should_send_notification(self, product_name: str) -> bool:
+        """Check if notification should be sent based on frequency settings."""
+        notification_frequency = self.config.get("notification_frequency", "weekly")
+        
+        if notification_frequency == "daily":
+            return True
+        
+        current_week = self.get_current_calendar_week()
+        
+        # Check if we've already sent a notification this week for this product
+        for entry in reversed(self.price_history):
+            if (entry.get("product_name") == product_name and 
+                entry.get("notification_sent") and 
+                entry.get("calendar_week") == current_week):
+                self.logger.info(f"Notification already sent this week ({current_week}) for {product_name}")
+                return False
+        
+        return True
 
     def load_price_history(self) -> List[Dict]:
         """Load price history from JSON file."""
@@ -336,8 +384,19 @@ class PriceMonitor:
         except Exception:
             pass  # Ignore errors during permission request
 
-    def send_macos_notification(self, title: str, message: str, sound: bool = True):
-        """Send persistent macOS notification."""
+    def send_desktop_notification(self, title: str, message: str, sound: bool = True):
+        """Send platform-appropriate desktop notification."""
+        if self.is_macos:
+            self._send_macos_notification(title, message, sound)
+        elif self.is_raspberry_pi:
+            # Raspberry Pi: Skip desktop notifications, rely on Telegram
+            self.logger.info(f"Skipping desktop notification on Raspberry Pi: {title}")
+        else:
+            # Generic Linux: Try notify-send
+            self._send_linux_notification(title, message)
+
+    def _send_macos_notification(self, title: str, message: str, sound: bool = True):
+        """Send macOS notification using AppleScript."""
         if not self.config.get("notifications", {}).get("macos_enabled", True):
             return
         
@@ -376,6 +435,34 @@ class PriceMonitor:
             print(f"\n🔔 {title}: {message}\n")
         except Exception as e:
             self.logger.error(f"Error sending macOS notification: {e}")
+            print(f"\n🔔 {title}: {message}\n")
+
+    def _send_linux_notification(self, title: str, message: str):
+        """Send Linux notification using notify-send."""
+        if not self.config.get("notifications", {}).get("linux_enabled", True):
+            return
+        
+        try:
+            # Try notify-send if available
+            result = subprocess.run([
+                "notify-send", 
+                f"--app-name=Yochi Price Monitor",
+                title, 
+                message
+            ], capture_output=True, timeout=5)
+            
+            if result.returncode == 0:
+                self.logger.info(f"Linux notification sent: {title}")
+            else:
+                # Fallback to terminal output
+                print(f"\n🔔 {title}: {message}\n")
+                
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            # Fallback to terminal output
+            print(f"\n🔔 {title}: {message}\n")
+            self.logger.info(f"Desktop notification fallback used: {title}")
+        except Exception as e:
+            self.logger.error(f"Error sending Linux notification: {e}")
             print(f"\n🔔 {title}: {message}\n")
 
     def send_email_notification(self, subject: str, body: str):
@@ -449,13 +536,15 @@ class PriceMonitor:
         except Exception as e:
             self.logger.error(f"Failed to send Telegram notification: {e}")
 
-    def record_price(self, price: float, product_name: str, is_discount: bool = False):
-        """Record price in history."""
+    def record_price(self, price: float, product_name: str, is_discount: bool = False, notification_sent: bool = False):
+        """Record price in history with enhanced tracking."""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "price": price,
             "product_name": product_name,
-            "is_discount": is_discount
+            "is_discount": is_discount,
+            "notification_sent": notification_sent,
+            "calendar_week": self.get_current_calendar_week()
         }
         
         self.price_history.append(entry)
@@ -478,30 +567,31 @@ class PriceMonitor:
         current_price, product_name = price_data
         is_discount_found, discount_percentage = self.is_discounted(current_price)
         
-        # Record the price
-        self.record_price(current_price, product_name, is_discount_found)
-        
         if is_discount_found:
             discount_percent = f"{discount_percentage:.1%}"
             
             # Extract product flavor for cleaner display
             product_flavor = product_name.split('|')[0].replace('Yo Chi Frozen', '').strip()
             
-            title = f"🎉 Best Yochi Deal Found!"
-            message = f"{product_flavor}\nNow ${current_price} ({discount_percent} off!)"
+            # Check if we should send notifications based on frequency settings
+            should_notify = self.should_send_notification(product_name)
             
-            # Send notifications
-            self.send_macos_notification(title, message)
-            
-            # Enhanced email with alternatives
-            alternatives_text = ""
-            if self.current_deal_info and self.current_deal_info.get("alternatives"):
-                alternatives_text = "\nOther options available:\n" + "\n".join(
-                    f"• {alt}" for alt in self.current_deal_info["alternatives"]
-                )
-            
-            email_subject = f"Best Yochi Deal - {discount_percent} Off!"
-            email_body = f"""
+            if should_notify:
+                title = f"🎉 Best Yochi Deal Found!"
+                message = f"{product_flavor}\nNow ${current_price} ({discount_percent} off!)"
+                
+                # Send notifications
+                self.send_desktop_notification(title, message)
+                
+                # Enhanced email with alternatives
+                alternatives_text = ""
+                if self.current_deal_info and self.current_deal_info.get("alternatives"):
+                    alternatives_text = "\nOther options available:\n" + "\n".join(
+                        f"• {alt}" for alt in self.current_deal_info["alternatives"]
+                    )
+                
+                email_subject = f"Best Yochi Deal - {discount_percent} Off!"
+                email_body = f"""
 🎉 Great news! Best Yochi deal found at Coles!
 
 🏆 BEST DEAL: {product_flavor}
@@ -512,18 +602,18 @@ class PriceMonitor:
 🛒 Shop now: {self.config['url']}
 
 Happy shopping!
-            """.strip()
-            
-            self.send_email_notification(email_subject, email_body)
-            
-            # Enhanced Telegram notification with alternatives
-            alternatives_telegram = ""
-            if self.current_deal_info and self.current_deal_info.get("alternatives"):
-                alternatives_telegram = "\n\n📋 <b>Other options:</b>\n" + "\n".join(
-                    f"• {alt}" for alt in self.current_deal_info["alternatives"]
-                )
-            
-            telegram_message = f"""
+                """.strip()
+                
+                self.send_email_notification(email_subject, email_body)
+                
+                # Enhanced Telegram notification with alternatives
+                alternatives_telegram = ""
+                if self.current_deal_info and self.current_deal_info.get("alternatives"):
+                    alternatives_telegram = "\n\n📋 <b>Other options:</b>\n" + "\n".join(
+                        f"• {alt}" for alt in self.current_deal_info["alternatives"]
+                    )
+                
+                telegram_message = f"""
 🎉 <b>Best Yochi Deal Found!</b>
 
 🏆 <b>BEST DEAL:</b> {product_flavor}
@@ -534,10 +624,19 @@ Happy shopping!
 <a href="{self.config['url']}">🛒 Shop Now at Coles</a>
 
 Happy shopping! 🛍️
-            """.strip()
-            
-            self.send_telegram_notification(telegram_message)
+                """.strip()
+                
+                self.send_telegram_notification(telegram_message)
+                
+                # Record that notification was sent
+                self.record_price(current_price, product_name, is_discount_found, notification_sent=True)
+            else:
+                # Record price without notification
+                self.record_price(current_price, product_name, is_discount_found, notification_sent=False)
+                self.logger.info(f"Discount found but notification throttled: {product_flavor} - ${current_price} ({discount_percent} off)")
         else:
+            # Record price for non-discount
+            self.record_price(current_price, product_name, is_discount_found, notification_sent=False)
             self.logger.info(f"No significant discount found. Current price: ${current_price}")
 
     def run_once(self, test_mode: bool = False):
@@ -570,8 +669,8 @@ def main():
         return
     
     if args.test_notifications:
-        print("Testing macOS notification...")
-        monitor.send_macos_notification("Test Notification", "This is a test message")
+        print("Testing desktop notification...")
+        monitor.send_desktop_notification("Test Notification", "This is a test message")
         
         print("Testing email notification...")
         monitor.send_email_notification("Test Email", "This is a test email from Price Monitor")
